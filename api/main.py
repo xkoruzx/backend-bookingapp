@@ -599,9 +599,18 @@ def parse_booking(pages, booking_no, prefix_arrival=None, prefix_departure=None,
         if dates:
             start = min(dates)
             end = max(dates)
-            service_date_ranges.append({'service': e['name'], 'start': start, 'end': end})
+            # ⚠️ แปลง date objects เป็น string
+            service_date_ranges.append({
+                'service': e['name'], 
+                'start': start.strftime("%d/%m/%Y") if start else None, 
+                'end': end.strftime("%d/%m/%Y") if end else None
+            })
         else:
-            service_date_ranges.append({'service': e['name'], 'start': None, 'end': None})
+            service_date_ranges.append({
+                'service': e['name'], 
+                'start': None, 
+                'end': None
+            })
 
     # If no passengers found, attempt a relaxed pass to capture uppercase names without titles.
     matched_lines = []
