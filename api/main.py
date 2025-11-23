@@ -98,11 +98,28 @@ def format_age_suffix(birth_str):
 
 
 def extract_all_pages(path):
+    """Extract text from all PDF pages with better error handling"""
     pages = []
-    with pdfplumber.open(path) as pdf:
-        for i, page in enumerate(pdf.pages):
-            pages.append((i + 1, page.extract_text()))
-    return pages
+    try:
+        print(f"   Opening PDF: {path}")
+        with pdfplumber.open(path) as pdf:
+            total_pages = len(pdf.pages)
+            print(f"   Total pages: {total_pages}")
+            
+            for i, page in enumerate(pdf.pages):
+                try:
+                    print(f"   Extracting page {i+1}/{total_pages}...")
+                    text = page.extract_text()
+                    pages.append((i + 1, text))
+                except Exception as e:
+                    print(f"   ⚠️ Error extracting page {i+1}: {str(e)}")
+                    pages.append((i + 1, ""))  # Empty text for failed pages
+            
+            print(f"   ✅ Extraction complete")
+            return pages
+    except Exception as e:
+        print(f"   ❌ Error opening PDF: {str(e)}")
+        raise
 
 
 def extract_flight_number(line):
