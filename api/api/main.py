@@ -2,18 +2,14 @@
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
-import os
-import tempfile
-import shutil
+import os, tempfile, shutil
 import pdfplumber
 import re
 from datetime import datetime, date
-from typing import Optional
+from typing import List, Optional
 from uuid import uuid4
-import traceback      # ⚠️ เพิ่มบรรทัดนี้
-import asyncio  
 
-app = FastAPI(title="Booking Parser API")
+app = FastAPI()
 
 # ============================================
 # CORS Configuration
@@ -27,19 +23,6 @@ app.add_middleware(
     expose_headers=["*"],
     max_age=3600,
 )
-
-# ============================================
-# Global Exception Handler
-# ============================================
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    print(f"❌ Global error: {str(exc)}")
-    print(traceback.format_exc())
-    return JSONResponse(
-        status_code=500,
-        content={"detail": f"Internal error: {str(exc)}"},
-        headers={"Access-Control-Allow-Origin": "*"}
-    )
 
 # ============================================
 # Middleware
@@ -654,9 +637,9 @@ def parse_booking(pages, booking_no, prefix_arrival=None, prefix_departure=None,
         "matched_lines": matched_lines,
     }
 
-# ============================================
-# Cache
-# ============================================
+# -------------------
+# In-memory cache
+# -------------------
 CACHE = {}
 CACHE_TTL_SECONDS = 60 * 30
 
@@ -678,96 +661,115 @@ def root():
     return {
         "status": "ok",
         "message": "🚂 Booking Parser API on Railway",
-        "version": "1.0.0"
+        "version": "1.0.0",
+        "endpoints": {
+            "upload": "POST /api/upload",
+            "search": "POST /api/search",
+            "parse": "POST /api/parse"
+        }
     }
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "cache_size": len(CACHE), "platform": "Railway"}
+    return {
+        "status": "healthy",
+        "cache_size": len(CACHE),
+        "platform": "Railway"
+    }
 
 @app.post("/api/upload")
 async def upload_pdf(file: UploadFile = File(...)):
-    """Upload PDF and cache"""
-    print("=" * 50)
-    print(f"📥 Upload request received")
-    print(f"   Filename: {file.filename}")
-    print(f"   Content-Type: {file.content_type}")
+    """Upload PDF and cache for fast searching"""
+    print(f"📥 Received upload: {file.filename}")
+    
+    _cleanup_cache()
+    
+    # Validate
+    if not file:
+        raise HTTPException(status_code=400, detail="No file provided")
+    
+    if not file.filename.lower().endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="File must be a PDF")
+    
+    # Read content
+    content = await file.read()
+    file_size_mb = len(content) / (1024 * 1024)
+    print(f"📄 File size: {file_size_mb:.2f} MB")
+    
+    # Limit file size to 15MB (Railway has more RAM)
+    if file_size_mb > 15:
+        raise HTTPException(status_code=400, detail="File too large (max 15MB)")
+    
+    # Create temp directory
+    tmp_dir = tempfile.mkdtemp()
+    tmp_path = os.path.join(tmp_dir, file.filename)
     
     try:
-        _cleanup_cache()
+        # Save file
+        print(f"💾 Saving to temp: {tmp_path}")
+        with open(tmp_path, "wb") as f:
+            f.write(content)
         
-        if not file:
-            raise HTTPException(status_code=400, detail="No file provided")
-        
-        if not file.filename.lower().endswith('.pdf'):
-            raise HTTPException(status_code=400, detail="File must be a PDF")
-        
-        print("📖 Reading file content...")
-        content = await file.read()
-        file_size_mb = len(content) / (1024 * 1024)
-        print(f"   Size: {file_size_mb:.2f} MB")
-        
-        if file_size_mb > 15:
-            raise HTTPException(status_code=400, detail=f"File too large: {file_size_mb:.2f}MB (max 15MB)")
-        
-        tmp_dir = tempfile.mkdtemp()
-        tmp_path = os.path.join(tmp_dir, file.filename)
-        print(f"💾 Temp path: {tmp_path}")
-        
+        # Extract pages with timeout
+        print("📖 Extracting pages...")
         try:
-            with open(tmp_path, "wb") as f:
-                f.write(content)
-            print("✅ File saved")
-            
-            print("📄 Extracting pages...")
             pages = await asyncio.wait_for(
                 asyncio.to_thread(extract_all_pages, tmp_path),
-                timeout=60.0
+                timeout=45.0  # 45 seconds (Railway มี timeout ยาวกว่า)
             )
             print(f"✅ Extracted {len(pages)} pages")
-            
-            print("🔍 Building index...")
-            index = build_booking_index(pages)
-            print(f"✅ Index built: {len(index)} bookings")
-            
-            session_id = str(uuid4())
-            CACHE[session_id] = {
-                "pages": pages,
-                "index": index,
-                "created": datetime.utcnow()
-            }
-            
-            print(f"✅ Upload successful: {session_id}")
-            print("=" * 50)
-            
-            return JSONResponse(
-                content={
-                    "sessionId": session_id,
-                    "pages": len(pages),
-                    "bookings": len(index),
-                    "status": "success"
-                },
-                headers={"Access-Control-Allow-Origin": "*"}
-            )
+        except asyncio.TimeoutError:
+            print("❌ Timeout extracting pages")
+            raise HTTPException(status_code=504, detail="PDF processing timeout")
+        except Exception as e:
+            print(f"❌ Error extracting: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
         
-        finally:
-            if tmp_dir and os.path.exists(tmp_dir):
-                try:
-                    shutil.rmtree(tmp_dir)
-                    print("🗑️ Cleaned up")
-                except Exception as e:
-                    print(f"⚠️ Cleanup error: {str(e)}")
+        # Build index
+        print("🔍 Building booking index...")
+        index = build_booking_index(pages)
+        print(f"✅ Index built: {len(index)} bookings found")
+        
+        # Create session
+        session_id = str(uuid4())
+        CACHE[session_id] = {
+            "pages": pages,
+            "index": index,
+            "created": datetime.utcnow()
+        }
+        
+        print(f"✅ Upload successful: {session_id}")
+        
+        return JSONResponse(
+            content={
+                "sessionId": session_id,
+                "pages": len(pages),
+                "bookings": len(index),
+                "status": "success"
+            },
+            headers={"Access-Control-Allow-Origin": "*"}
+        )
     
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ Error: {str(e)}")
+        print(f"❌ Unexpected error: {str(e)}")
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
+    
+    finally:
+        try:
+            shutil.rmtree(tmp_dir)
+            print("🗑️ Cleaned up temp files")
+        except Exception as e:
+            print(f"⚠️ Cleanup error: {str(e)}")
 
 @app.post("/api/search")
-async def search_cache(booking: str = Form(...), sessionId: str = Form(...)):
-    """Search cached PDF"""
+async def search_cache(
+    booking: str = Form(...),
+    sessionId: str = Form(...)
+):
+    """Search cached PDF by booking number"""
     print(f"🔍 Search: booking={booking}, session={sessionId[:8]}...")
     
     if not booking or not sessionId:
@@ -775,6 +777,7 @@ async def search_cache(booking: str = Form(...), sessionId: str = Form(...)):
     
     entry = CACHE.get(sessionId)
     if not entry:
+        print(f"❌ Session not found: {sessionId}")
         raise HTTPException(status_code=404, detail="Session not found or expired")
     
     pages = entry.get("pages")
@@ -782,17 +785,26 @@ async def search_cache(booking: str = Form(...), sessionId: str = Form(...)):
     pre_matched = index.get(booking) if index else None
     
     try:
-        result = parse_booking(pages, booking, None, None, pre_matched)
+        result = parse_booking(
+            pages, booking,
+            prefix_arrival=None,
+            prefix_departure=None,
+            pre_matched_pages=pre_matched
+        )
         
         if not result:
+            print(f"❌ Booking not found: {booking}")
             raise HTTPException(status_code=404, detail="Booking not found")
         
         result["booking"] = booking
         result["sessionId"] = sessionId
         
-        print(f"✅ Search successful")
+        print(f"✅ Search successful: {booking}")
         
-        return JSONResponse(content=result, headers={"Access-Control-Allow-Origin": "*"})
+        return JSONResponse(
+            content=result,
+            headers={"Access-Control-Allow-Origin": "*"}
+        )
     
     except HTTPException:
         raise
@@ -802,8 +814,13 @@ async def search_cache(booking: str = Form(...), sessionId: str = Form(...)):
         raise HTTPException(status_code=500, detail=f"Search error: {str(e)}")
 
 @app.post("/api/parse")
-async def parse_upload(booking: str = Form(...), file: UploadFile = File(...)):
-    """Parse PDF without caching"""
+async def parse_upload(
+    booking: str = Form(...),
+    file: UploadFile = File(...)
+):
+    """Parse PDF without caching (one-time use)"""
+    print(f"📥 Parse: booking={booking}, file={file.filename}")
+    
     if not booking:
         raise HTTPException(status_code=400, detail="booking required")
     
@@ -811,7 +828,7 @@ async def parse_upload(booking: str = Form(...), file: UploadFile = File(...)):
     file_size_mb = len(content) / (1024 * 1024)
     
     if file_size_mb > 15:
-        raise HTTPException(status_code=400, detail="File too large")
+        raise HTTPException(status_code=400, detail="File too large (max 15MB)")
     
     tmp_dir = tempfile.mkdtemp()
     tmp_path = os.path.join(tmp_dir, file.filename)
@@ -820,22 +837,33 @@ async def parse_upload(booking: str = Form(...), file: UploadFile = File(...)):
         with open(tmp_path, "wb") as f:
             f.write(content)
         
-        pages = await asyncio.wait_for(
-            asyncio.to_thread(extract_all_pages, tmp_path),
-            timeout=60.0
-        )
+        try:
+            pages = await asyncio.wait_for(
+                asyncio.to_thread(extract_all_pages, tmp_path),
+                timeout=45.0
+            )
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=504, detail="PDF processing timeout")
         
         index = build_booking_index(pages)
         pre_matched = index.get(booking)
         
-        result = parse_booking(pages, booking, None, None, pre_matched)
+        result = parse_booking(
+            pages, booking,
+            prefix_arrival=None,
+            prefix_departure=None,
+            pre_matched_pages=pre_matched
+        )
         
         if not result:
             raise HTTPException(status_code=404, detail="Booking not found")
         
         result["booking"] = booking
         
-        return JSONResponse(content=result, headers={"Access-Control-Allow-Origin": "*"})
+        return JSONResponse(
+            content=result,
+            headers={"Access-Control-Allow-Origin": "*"}
+        )
     
     except HTTPException:
         raise
@@ -850,6 +878,7 @@ async def parse_upload(booking: str = Form(...), file: UploadFile = File(...)):
         except:
             pass
 
+# OPTIONS handlers
 @app.options("/api/upload")
 @app.options("/api/search")
 @app.options("/api/parse")
