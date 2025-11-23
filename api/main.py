@@ -708,7 +708,6 @@ async def upload_pdf(file: UploadFile = File(...)):
     print("=" * 50)
     print(f"📥 Upload request received")
     print(f"   Filename: {file.filename}")
-    print(f"   Content-Type: {file.content_type}")
     
     try:
         _cleanup_cache()
@@ -724,12 +723,12 @@ async def upload_pdf(file: UploadFile = File(...)):
         file_size_mb = len(content) / (1024 * 1024)
         print(f"   Size: {file_size_mb:.2f} MB")
         
-        if file_size_mb > 15:
-            raise HTTPException(status_code=400, detail=f"File too large: {file_size_mb:.2f}MB (max 15MB)")
+        # ⚠️ ลดขนาดไฟล์สูงสุด
+        if file_size_mb > 10:
+            raise HTTPException(status_code=400, detail=f"File too large: {file_size_mb:.2f}MB (max 10MB)")
         
         tmp_dir = tempfile.mkdtemp()
         tmp_path = os.path.join(tmp_dir, file.filename)
-        print(f"💾 Temp path: {tmp_path}")
         
         try:
             with open(tmp_path, "wb") as f:
@@ -737,11 +736,26 @@ async def upload_pdf(file: UploadFile = File(...)):
             print("✅ File saved")
             
             print("📄 Extracting pages...")
-            pages = await asyncio.wait_for(
-                asyncio.to_thread(extract_all_pages, tmp_path),
-                timeout=60.0
-            )
-            print(f"✅ Extracted {len(pages)} pages")
+            try:
+                # ⚠️ ลด timeout เหลือ 30 วินาที
+                pages = await asyncio.wait_for(
+                    asyncio.to_thread(extract_all_pages, tmp_path),
+                    timeout=30.0
+                )
+                print(f"✅ Extracted {len(pages)} pages")
+            except asyncio.TimeoutError:
+                print("❌ Timeout after 30 seconds")
+                raise HTTPException(
+                    status_code=504, 
+                    detail="PDF processing timeout. File may be too complex. Try a smaller file."
+                )
+            except Exception as e:
+                print(f"❌ Extraction error: {str(e)}")
+                print(traceback.format_exc())
+                raise HTTPException(
+                    status_code=500, 
+                    detail=f"Error extracting PDF: {str(e)}"
+                )
             
             print("🔍 Building index...")
             index = build_booking_index(pages)
@@ -778,9 +792,12 @@ async def upload_pdf(file: UploadFile = File(...)):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ Error: {str(e)}")
+        print(f"❌ Unexpected error: {str(e)}")
         print(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Server error: {str(e)}"
+        )
 
 @app.post("/api/search")
 async def search_cache(booking: str = Form(...), sessionId: str = Form(...)):
